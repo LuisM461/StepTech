@@ -12,6 +12,28 @@
 //CRGB leds[NUM_LEDS];
 //----------------------------------
 
+static const unsigned long debouncePressMs   = 30;      // faster commit on press (falling)
+static const unsigned long debounceReleaseMs = 80;      // slower commit on release (rising)
+static constexpr int R = Pins::rows;
+static constexpr int C = Pins::cols;
+
+static int lastReading[R][C];
+static int stableState[R][C];
+static unsigned long lastChangeMs[R][C];
+
+
+// Button debounce code for consistent button press
+void initDebounce() {
+  unsigned long now = millis();
+  for (int r = 0; r < R; ++r) {
+    for (int c = 0; c < C; ++c) {
+      lastReading[r][c]  = HIGH;   // INPUT_PULLUP idle = HIGH
+      stableState[r][c]  = HIGH;
+      lastChangeMs[r][c] = now;
+    }
+  }
+}
+
 
 // static inline int xy(int r, int c) {
 //   if (r < 0 || r >= MATRIX_H || c < 0 || c >= MATRIX_W) 
@@ -41,6 +63,7 @@ void setup() {
     }
   }
 
+  initDebounce();
   // FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   // FastLED.setBrightness(BRIGHTNESS);
   // FastLED.clear(true);            // clears and shows leds
@@ -60,10 +83,31 @@ void setup() {
 }
 
 void loop() {
+  unsigned long now = millis();
+
   for (int r = 0; r < Pins::rows; ++r) {
     for (int c = 0; c < Pins:: cols; ++c) {
-      bool pressed = (digitalRead(Pins::BUTTONS[r][c]) == LOW);
+      int reading = digitalRead(Pins::BUTTONS[r][c]);
       
+      // --- Button debounce code ---
+      if(reading != lastReading[r][c]) {
+        lastReading[r][c]  = reading;
+        lastChangeMs[r][c] = now;
+      }
+      
+      if (reading != stableState[r][c]) {
+        unsigned long needStable =
+          (stableState[r][c] == HIGH && reading == LOW)
+            ? debouncePressMs        // falling edge (press)
+            : debounceReleaseMs;     // rising edge (release)
+
+        if ((now - lastChangeMs[r][c]) >= needStable) {
+          stableState[r][c] = reading;  // commit debounced state
+        }
+      }
+      // ----------------------------
+
+      bool pressed = (stableState[r][c] == LOW);
       digitalWrite(Pins::LEDS[r][c], pressed ? HIGH : LOW);
     }
   }
