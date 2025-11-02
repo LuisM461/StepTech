@@ -49,7 +49,7 @@ inline bool readPressed() {
 
 void showCue() {
   // A visible cue color (purple/orange/etc.)
-  fill_solid(leds, LED_COUNT, CRGB(148, 0, 211));  // purple
+  fill_solid(leds, LED_COUNT, CRGB::Red);  // purple
   FastLED.show();
 }
 
