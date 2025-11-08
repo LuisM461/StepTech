@@ -16,24 +16,33 @@ CRGB leds[NUM_LEDS];
 #define MUX_S2  26
 #define MUX_S3  27
 
-int  sensorValues[NUM_TILES];
-bool pressedNow [NUM_TILES];
+int  sensorValues[NUM_TILES];  // raw ADC (for debug)
+bool pressedNow [NUM_TILES];   // debounced + hysteresis presses
 bool pressedPrev[NUM_TILES];
 
 const bool PRESS_IS_LOWER = true;  // true = value drops when pressed
 
-// ---------- INDIVIDUAL THRESHOLDS (per MUX channel C0..C8) ----------
-int thresholds[NUM_TILES] = {
-  50,   // C0 → Tile 1 (label 1)
-  120,   // C1 → Tile 2
-  50,   // C2 → Tile 3
-  120,   // C3 → Tile 4
-  50,  // C4 → Tile 5
-  50,  // C5 → Tile 6
-  50,  // C6 → Tile 7
-  50,  // C7 → Tile 8
-  50   // C8 → Tile 9
-};
+// ---------- SENSITIVITY / FILTER CONFIG ----------
+
+// How big the drop from idle to count as "pressed" (since lower = pressed)
+const float PRESS_FACTOR   = 0.70f;   // 70% of idle → press
+const float RELEASE_FACTOR = 0.78f;   // 78% of idle → release (hysteresis)
+
+// EMA smoothing factor (0..1). Smaller = smoother, less twitchy.
+const float EMA_ALPHA = 0.25f;
+
+// Debounce timings (ms)
+const uint16_t MIN_PRESS_MS   = 60;   // must stay in "press" region this long
+const uint16_t MIN_RELEASE_MS = 60;   // must stay in "release" region this long
+
+// ---------- BASELINES + THRESHOLDS + FILTER STATE ----------
+int baseline[NUM_TILES];     // idle values (no weight)
+int thrPress[NUM_TILES];     // "go pressed" threshold
+int thrRelease[NUM_TILES];   // "go released" threshold
+int filtValue[NUM_TILES];    // smoothed ADC value
+
+bool      stablePressed[NUM_TILES];  // internal stable state
+uint32_t  lastEdgeMs[NUM_TILES];     // last time state change was considered
 
 // ---------- LED INDEX MAP (daisy-chain order) ----------
 // Chain order: 9 → 4 → 3 → 2 → 5 → 8 → 7 → 6 → 1
@@ -122,10 +131,6 @@ inline void selectMuxChannel(uint8_t ch) {
   delayMicroseconds(200);
 }
 
-inline bool isPressedVal(int v, int thr) {
-  return PRESS_IS_LOWER ? (v < thr) : (v > thr);
-}
-
 inline void setTileColor(int t, const CRGB &c) {
   int s = tileStart[t], e = tileEnd(t);
   for (int i = s; i < e; i++) leds[i] = c;
@@ -150,7 +155,9 @@ void loadRequiredMask() {
 void showCurrentSetPreview() {
   clearAll();
   for (int t = 0; t < NUM_TILES; t++) {
-    if (requiredMask & (1u << t)) setTileColor(t, tileColors[t]); // preview with per-tile color
+    if (requiredMask & (1u << t)) {
+      setTileColor(t, tileColors[t]); // preview with per-tile color
+    }
   }
   FastLED.show();
 }
@@ -173,6 +180,54 @@ void resetGame() {
   startShowPhase();
 }
 
+// ---- Calibration: measure idle values and build thresholds ----
+void calibrateThresholds() {
+  Serial.println("=== Sensor calibration ===");
+  Serial.println("Make sure NO ONE is standing on the tiles...");
+  delay(2500);
+
+  const int samples = 20;
+
+  for (int ch = 0; ch < NUM_TILES; ch++) {
+    selectMuxChannel(ch);
+    delay(5); // settle MUX
+
+    long sum = 0;
+    // discard first read after mux switch
+    analogRead(MUX_SIG);
+    delay(2);
+
+    for (int i = 0; i < samples; i++) {
+      sum += analogRead(MUX_SIG);
+      delay(2);
+    }
+
+    int idle = sum / samples;
+    baseline[ch]  = idle;
+    filtValue[ch] = idle;   // start EMA at idle
+
+    if (PRESS_IS_LOWER) {
+      thrPress[ch]   = (int)(idle * PRESS_FACTOR);     // press when BELOW
+      thrRelease[ch] = (int)(idle * RELEASE_FACTOR);   // release when ABOVE
+      if (thrPress[ch]   < 0)    thrPress[ch]   = 0;
+      if (thrRelease[ch] < 0)    thrRelease[ch] = 0;
+    } else {
+      thrPress[ch]   = (int)(idle / PRESS_FACTOR);     // press when ABOVE
+      thrRelease[ch] = (int)(idle / RELEASE_FACTOR);   // release when BELOW
+      if (thrPress[ch]   > 4095) thrPress[ch]   = 4095;
+      if (thrRelease[ch] > 4095) thrRelease[ch] = 4095;
+    }
+
+    stablePressed[ch] = false;
+    lastEdgeMs[ch]    = millis();
+
+    Serial.printf("Ch %d idle=%4d  thrP=%4d  thrR=%4d\n",
+                  ch, idle, thrPress[ch], thrRelease[ch]);
+  }
+
+  Serial.println("Calibration done.");
+}
+
 // ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
@@ -186,6 +241,19 @@ void setup() {
   pinMode(MUX_S1, OUTPUT);
   pinMode(MUX_S2, OUTPUT);
   pinMode(MUX_S3, OUTPUT);
+
+  // init press arrays
+  for (int i = 0; i < NUM_TILES; i++) {
+    pressedNow[i] = pressedPrev[i] = false;
+    stablePressed[i] = false;
+    lastEdgeMs[i] = 0;
+    baseline[i] = 0;
+    thrPress[i] = thrRelease[i] = 0;
+    filtValue[i] = 0;
+  }
+
+  // ----- CALIBRATE SENSORS -----
+  calibrateThresholds();
 
   Serial.println("Sequential lighting in daisy-chain order...");
   delay(500);
@@ -203,24 +271,59 @@ void setup() {
   FastLED.show();
   Serial.println("Ready for memory game...");
 
-  // init press arrays
-  for (int i = 0; i < NUM_TILES; i++) pressedNow[i] = pressedPrev[i] = false;
-
   // begin game
   startShowPhase();
 }
 
 // ---------- LOOP ----------
 void loop() {
-  // -------- read sensors & update pressed states --------
+  // -------- read sensors & update pressed states (EMA + hysteresis + debounce) --------
   for (int ch = 0; ch < NUM_TILES; ch++) {
     selectMuxChannel(ch);
     delayMicroseconds(150);
-    sensorValues[ch] = analogRead(MUX_SIG);
+    int raw = analogRead(MUX_SIG);
+    sensorValues[ch] = raw;
 
-    int t           = sensorToTile[ch];
-    pressedPrev[t]  = pressedNow[t];
-    pressedNow[t]   = isPressedVal(sensorValues[ch], thresholds[ch]);
+    // EMA smoothing
+    filtValue[ch] = (int)(filtValue[ch] + EMA_ALPHA * (raw - filtValue[ch]));
+
+    int t = sensorToTile[ch];  // map mux channel to tile index
+    bool wantPressed;
+
+    if (PRESS_IS_LOWER) {
+      if (!stablePressed[t]) {
+        // currently "not pressed" → only go pressed if below thrPress
+        wantPressed = (filtValue[ch] < thrPress[ch]);
+      } else {
+        // currently pressed → stay pressed until clearly above thrRelease
+        wantPressed = (filtValue[ch] < thrRelease[ch]);
+      }
+    } else {
+      if (!stablePressed[t]) {
+        wantPressed = (filtValue[ch] > thrPress[ch]);
+      } else {
+        wantPressed = (filtValue[ch] > thrRelease[ch]);
+      }
+    }
+
+    uint32_t now = millis();
+    bool aboutToFlip = (wantPressed != stablePressed[t]);
+
+    if (aboutToFlip) {
+      uint16_t needMs = wantPressed ? MIN_PRESS_MS : MIN_RELEASE_MS;
+      if (now - lastEdgeMs[t] >= needMs) {
+        // Commit the flip
+        stablePressed[t] = wantPressed;
+        lastEdgeMs[t]    = now;
+      }
+    } else {
+      // If nothing is trying to change, keep timer aligned
+      lastEdgeMs[t] = now;
+    }
+
+    // Expose stable state to the game logic
+    pressedPrev[t] = pressedNow[t];
+    pressedNow[t]  = stablePressed[t];
   }
 
   // -------- state machine --------
@@ -244,11 +347,14 @@ void loop() {
         if (pressedNow[t]) {
           setTileColor(t, isReq ? CRGB::Green : CRGB::Red);
         }
-        // rising edge logic
+
+        // rising edge logic (use debounced presses)
         if (pressedNow[t] && !pressedPrev[t]) {
           if (isReq) {
             progressMask |= (1u << t);
-            if ((progressMask & requiredMask) == requiredMask) completed = true;
+            if ((progressMask & requiredMask) == requiredMask) {
+              completed = true;
+            }
           } else {
             wrongTile = t;
             state = WRONG_HOLD;
@@ -289,12 +395,14 @@ void loop() {
   static uint32_t last = 0;
   if (millis() - last > 300) {
     last = millis();
-    Serial.print("Sensors: ");
+    Serial.print("Raw: ");
     for (int i = 0; i < NUM_TILES; i++) Serial.printf("%4d ", sensorValues[i]);
+    Serial.print(" | Filt: ");
+    for (int i = 0; i < NUM_TILES; i++) Serial.printf("%4d ", filtValue[i]);
     Serial.print(" | Pressed: ");
     for (int t = 0; t < NUM_TILES; t++) Serial.print(pressedNow[t] ? '1' : '0');
-    Serial.print(" | Required mask: ");
-    Serial.println(requiredMask, BIN);
+    Serial.println();
+    last = millis();
   }
   */
 }
