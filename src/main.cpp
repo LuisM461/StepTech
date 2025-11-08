@@ -8,7 +8,7 @@
 #define SENSOR_PIN      34          // ESP32 ADC1 pin recommended
 #define LEDS_PER_TILE   256         // e.g., 16x16
 #define LED_COUNT       LEDS_PER_TILE
-#define BRIGHTNESS      32
+#define BRIGHTNESS      25
 
 // ----------------------------
 // Velostat tuning
@@ -96,8 +96,6 @@ void setup() {
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.clear(true);
 
-  // SENSOR_PIN is analog-input only on many ESP32 boards; no pinMode needed,
-  // but it's harmless to set explicitly:
   pinMode(SENSOR_PIN, INPUT);
 
   // Startup: flash green, then off → wait for press
@@ -139,7 +137,7 @@ void loop() {
       if (now - stateStartMs >= FEEDBACK_BLUE_MS) {
         // Loop back: flash green again then wait for next press
         showGreen();
-        enter(CUE_FLASH_GREEN);
+        enter(WAIT_FOR_PRESS);
       }
     } break;
   }
