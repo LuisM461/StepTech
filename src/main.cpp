@@ -1,114 +1,136 @@
 #include <Arduino.h>
-#include <FastLED.h>
-#include "../include/pins.hpp"
+#include <WiFi.h>
+#include <WebServer.h>
 
-// LED MATRIX DEFINES --------------
-//#define MATRIX_W        16
-//#define MATRIX_H        16
-//#define NUM_LEDS        (MATRIX_W * MATRIX_H)
-//#define BRIGHTNESS      35          // keep low while testing (0..255)
-//#define LED_TYPE        WS2812B
-//#define COLOR_ORDER     GRB
-//CRGB leds[NUM_LEDS];
-//----------------------------------
+// ---------- Wi-Fi config ----------
+const char* AP_SSID     = "ESP32_TILE";
+const char* AP_PASSWORD = "steptech123";   // change this if you want
 
-static const unsigned long debouncePressMs   = 30;      // faster commit on press (falling)
-static const unsigned long debounceReleaseMs = 80;      // slower commit on release (rising)
-static constexpr int R = Pins::rows;
-static constexpr int C = Pins::cols;
+WebServer server(80);
 
-static int lastReading[R][C];
-static int stableState[R][C];
-static unsigned long lastChangeMs[R][C];
+// A simple "state" variable we'll read/change from the phone
+int tileMode = 0;  // 0 = idle, 1 = game, etc.
 
+// ---------- HTML page ----------
+String htmlPage() {
+  String page =
+"<!DOCTYPE html>\n"
+"<html>\n"
+"  <head>\n"
+"    <meta charset=\"UTF-8\">\n"
+"    <title>ESP32 Tile Control</title>\n"
+"    <style>\n"
+"      body { font-family: sans-serif; background:#111; color:#eee; text-align:center; }\n"
+"      h1 { margin-top: 30px; }\n"
+"      button {\n"
+"        padding: 12px 20px;\n"
+"        margin: 10px;\n"
+"        font-size: 16px;\n"
+"        border-radius: 8px;\n"
+"        border: none;\n"
+"        cursor: pointer;\n"
+"      }\n"
+"      .idle { background:#444; }\n"
+"      .game { background:#2e8b57; }\n"
+"    </style>\n"
+"  </head>\n"
+"  <body>\n"
+"    <h1>ESP32 Tile Control</h1>\n"
+"    <p>Current mode: <span id=\"mode\">?</span></p>\n"
+"    <button class=\"idle\" onclick=\"setMode(0)\">Idle</button>\n"
+"    <button class=\"game\" onclick=\"setMode(1)\">Game</button>\n"
+"\n"
+"    <script>\n"
+"      function setMode(m) {\n"
+"        fetch(\"/setMode?value=\" + m)\n"
+"          .then(r => r.text())\n"
+"          .then(t => {\n"
+"            console.log(\"Response:\", t);\n"
+"            updateMode();\n"
+"          });\n"
+"      }\n"
+"\n"
+"      function updateMode() {\n"
+"        fetch(\"/getMode\")\n"
+"          .then(r => r.text())\n"
+"          .then(t => {\n"
+"            document.getElementById(\"mode\").innerText = t;\n"
+"          });\n"
+"      }\n"
+"\n"
+"      // Load on page open\n"
+"      updateMode();\n"
+"      // Auto-refresh every 2 seconds\n"
+"      setInterval(updateMode, 2000);\n"
+"    </script>\n"
+"  </body>\n"
+"</html>\n";
 
-// Button debounce code for consistent button press
-void initDebounce() {
-  unsigned long now = millis();
-  for (int r = 0; r < R; ++r) {
-    for (int c = 0; c < C; ++c) {
-      lastReading[r][c]  = HIGH;   // INPUT_PULLUP idle = HIGH
-      stableState[r][c]  = HIGH;
-      lastChangeMs[r][c] = now;
-    }
+  return page;
+}
+
+// ---------- HTTP handlers ----------
+void handleRoot() {
+  server.send(200, "text/html", htmlPage());
+}
+
+void handleGetMode() {
+  String s = String(tileMode);
+  server.send(200, "text/plain", s);
+}
+
+void handleSetMode() {
+  if (server.hasArg("value")) {
+    tileMode = server.arg("value").toInt();
+    Serial.print("Mode set from phone: ");
+    Serial.println(tileMode);
+    // TODO: here you can trigger LED behavior based on tileMode
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing 'value' parameter");
   }
 }
 
+void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
+}
 
-// static inline int xy(int r, int c) {
-//   if (r < 0 || r >= MATRIX_H || c < 0 || c >= MATRIX_W) 
-//     return 0;
-
-//   if (r & 1) 
-//     return r * MATRIX_W + (MATRIX_W - 1 - c);           // odd row
-
-//   return r * MATRIX_W + c;                              // even row
-// }
-
+// ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting...");
-  delay(50);
+  delay(200);
 
-  for (int r = 0; r < Pins::rows; ++r) {
-    for (int c = 0; c < Pins::cols; ++c) {
-      pinMode(Pins::LEDS[r][c], OUTPUT);
-      digitalWrite(Pins::LEDS[r][c], LOW);
-    }
+  // Start Wi-Fi Access Point
+  Serial.println("Starting Wi-Fi AP...");
+  WiFi.mode(WIFI_AP);
+  bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  if (!apStarted) {
+    Serial.println("Failed to start AP!");
+  } else {
+    Serial.print("AP started. SSID: ");
+    Serial.println(AP_SSID);
+
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);   // typically 192.168.4.1
   }
 
-  for (int r = 0; r < Pins::rows; ++r) {
-    for (int c = 0; c < Pins::cols; ++c) {
-      pinMode(Pins::BUTTONS[r][c], INPUT_PULLUP);       // active low
-    }
-  }
+  // Setup routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/getMode", HTTP_GET, handleGetMode);
+  server.on("/setMode", HTTP_GET, handleSetMode);
+  server.onNotFound(handleNotFound);
 
-  initDebounce();
-  // FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  // FastLED.setBrightness(BRIGHTNESS);
-  // FastLED.clear(true);            // clears and shows leds
-
-  // --- Show top-left 4 pixels by (row,col) using the map ---
-  // FastLED.clear();
-  // leds[xy(0,0)] = CRGB::Red;      // top-left
-  // leds[xy(0,1)] = CRGB::Red;
-  // leds[xy(1,0)] = CRGB::Red;
-  // leds[xy(1,1)] = CRGB::Red;
-  // FastLED.show();
-  // Serial.println("Shown: 2x2 block at top-left via xy()");
-  // delay(2500);
-
-  // // --- First row chase so you can confirm serpentine direction ---
-  // FastLED.clear(true);            // clears and shows leds
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
 void loop() {
-  unsigned long now = millis();
+  // Handle incoming HTTP requests
+  server.handleClient();
 
-  for (int r = 0; r < Pins::rows; ++r) {
-    for (int c = 0; c < Pins:: cols; ++c) {
-      int reading = digitalRead(Pins::BUTTONS[r][c]);
-      
-      // --- Button debounce code ---
-      if(reading != lastReading[r][c]) {
-        lastReading[r][c]  = reading;
-        lastChangeMs[r][c] = now;
-      }
-      
-      if (reading != stableState[r][c]) {
-        unsigned long needStable =
-          (stableState[r][c] == HIGH && reading == LOW)
-            ? debouncePressMs        // falling edge (press)
-            : debounceReleaseMs;     // rising edge (release)
-
-        if ((now - lastChangeMs[r][c]) >= needStable) {
-          stableState[r][c] = reading;  // commit debounced state
-        }
-      }
-      // ----------------------------
-
-      bool pressed = (stableState[r][c] == LOW);
-      digitalWrite(Pins::LEDS[r][c], pressed ? HIGH : LOW);
-    }
-  }
+  // Here you would use tileMode to control LEDs, etc.
+  // Example:
+  // if (tileMode == 0) showIdlePattern();
+  // else if (tileMode == 1) showGamePattern();
 }
