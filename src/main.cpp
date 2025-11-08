@@ -1,191 +1,300 @@
-#include <Arduino.h>
 #include <FastLED.h>
 
-// ----------------------------
-// Hardware config (single tile)
-// ----------------------------
-#define LED_PIN         13
-#define SENSOR_PIN      34          // ESP32 ADC1 pin recommended
-#define LEDS_PER_TILE   256         // e.g., 16x16
-#define LED_COUNT       LEDS_PER_TILE
-#define BRIGHTNESS      25
+// ---------- LED CONFIG ----------
+#define DATA_PIN    13
+#define BRIGHTNESS  25
+#define NUM_TILES   9
+#define TILE_SIZE   256
+#define NUM_LEDS    (TILE_SIZE * NUM_TILES)
 
-// Logical matrix size (16x16 = 256)
-#define MATRIX_W        16
-#define MATRIX_H        16
+CRGB leds[NUM_LEDS];
 
-// ----------------------------
-// Velostat tuning
-// ----------------------------
-// If pressed reads LOWER than idle, leave as 1. If pressed reads HIGHER, set to 0.
-#define PRESS_ACTIVE_LOW  1
-// Pick a threshold between your idle and pressed readings (0..4095 on ESP32 ADC)
-#define THRESHOLD         1500
-#define DEBOUNCE_MS       150
+// ---------- SENSOR CONFIG ----------
+#define MUX_SIG 34
+#define MUX_S0  14
+#define MUX_S1  25
+#define MUX_S2  26
+#define MUX_S3  27
 
-// ----------------------------
-// Timing (ms)
-// ----------------------------
-#define FLASH_GREEN_MS     300      // startup cue flash
-#define FEEDBACK_BLUE_MS   700      // blue confirmation flash after release
+int  sensorValues[NUM_TILES];
+bool pressedNow [NUM_TILES];
+bool pressedPrev[NUM_TILES];
 
-CRGB leds[LED_COUNT];
+const bool PRESS_IS_LOWER = true;  // true = value drops when pressed
 
-enum State { CUE_FLASH_GREEN, WAIT_FOR_PRESS, PRESSED_HELD, FEEDBACK_BLUE };
-State state = CUE_FLASH_GREEN;
+// ---------- INDIVIDUAL THRESHOLDS (per MUX channel C0..C8) ----------
+int thresholds[NUM_TILES] = {
+  25,   // C0 → Tile 1 (label 1)
+  25,   // C1 → Tile 2
+  25,   // C2 → Tile 3
+  25,   // C3 → Tile 4
+  100,  // C4 → Tile 5
+  100,  // C5 → Tile 6
+  100,  // C6 → Tile 7
+  100,  // C7 → Tile 8
+  100   // C8 → Tile 9
+};
 
-uint32_t stateStartMs = 0;
+// ---------- LED INDEX MAP (daisy-chain order) ----------
+// Chain order: 9 → 4 → 3 → 2 → 5 → 8 → 7 → 6 → 1
+const int tileStart[NUM_TILES] = {
+  0,             // index 0 = label 9
+  1 * TILE_SIZE, // index 1 = label 4
+  2 * TILE_SIZE, // index 2 = label 3
+  3 * TILE_SIZE, // index 3 = label 2
+  4 * TILE_SIZE, // index 4 = label 5
+  5 * TILE_SIZE, // index 5 = label 8
+  6 * TILE_SIZE, // index 6 = label 7
+  7 * TILE_SIZE, // index 7 = label 6
+  8 * TILE_SIZE  // index 8 = label 1
+};
+int tileEnd(int t) { return (t == NUM_TILES - 1) ? NUM_LEDS : tileStart[t + 1]; }
 
-// Edge/debounce tracking
-bool lastPressed = false;
-uint32_t lastEdgeMs = 0;
+// ---------- SENSOR → TILE MAP (C0..C8 to internal tile index 0..8) ----------
+const int sensorToTile[NUM_TILES] = {
+  8, // C0 → Tile label 1 (internal 8)
+  3, // C1 → label 2  (internal 3)
+  2, // C2 → label 3  (internal 2)
+  1, // C3 → label 4  (internal 1)
+  4, // C4 → label 5  (internal 4)
+  7, // C5 → label 6  (internal 7)
+  6, // C6 → label 7  (internal 6)
+  5, // C7 → label 8  (internal 5)
+  0  // C8 → label 9  (internal 0)
+};
 
-// ----------------------------
-// Helpers
-// ----------------------------
+// ---------- FIXED COLORS (only used for PREVIEW) ----------
+CRGB tileColors[NUM_TILES] = {
+  CRGB(0, 120, 255),   // internal 0  = label 9
+  CRGB(255, 0, 0),     // internal 1  = label 4
+  CRGB(0, 255, 0),     // internal 2  = label 3
+  CRGB(255, 90, 0),    // internal 3  = label 2
+  CRGB(0, 0, 180),     // internal 4  = label 5
+  CRGB(255, 90, 0),    // internal 5  = label 8
+  CRGB(0, 150, 0),     // internal 6  = label 7
+  CRGB(0, 255, 180),   // internal 7  = label 6
+  CRGB(180, 0, 255)    // internal 8  = label 1
+};
 
-// Map (row, col) → LED index (assuming simple row-major wiring)
-inline uint16_t indexFromRC(uint8_t r, uint8_t c) {
-  return r * MATRIX_W + c;  // 0 <= r < 16, 0 <= c < 16
+// ---------- GAME CONFIG ----------
+#define SHOW_MS 2500  // how long the 3 tiles preview stays lit before waiting for input
+
+// Map from human labels (1..9) to internal indices (0..8)
+const int8_t labelToIndex[10] = {
+  -1, // 0 unused
+   8, // label 1 → internal 8
+   3, // label 2 → internal 3
+   2, // label 3 → internal 2
+   1, // label 4 → internal 1
+   4, // label 5 → internal 4
+   7, // label 6 → internal 7
+   6, // label 7 → internal 6
+   5, // label 8 → internal 5
+   0  // label 9 → internal 0
+};
+
+// Define your fixed “random-looking” triplets here using labels (1..9).
+const uint8_t SEQ_LABELS[][3] = {
+  {3, 5, 1},   // first set
+  {9, 4, 2},
+  {8, 6, 7},
+  {1, 2, 3},
+  {9, 5, 8}
+};
+const uint8_t SEQ_LEN = sizeof(SEQ_LABELS) / sizeof(SEQ_LABELS[0]);
+
+// ---------- STATE MACHINE ----------
+enum GameState { SHOW_SET, WAIT_INPUT, WRONG_HOLD };
+GameState state = SHOW_SET;
+uint32_t stateStart = 0;
+uint8_t  seqIndex   = 0;
+
+uint16_t requiredMask = 0;   // which tiles are required (3 bits)
+uint16_t progressMask = 0;   // which required tiles have been stepped at least once
+int      wrongTile    = -1;  // track a wrong tile while held
+
+// ---------- HELPERS ----------
+inline void selectMuxChannel(uint8_t ch) {
+  digitalWrite(MUX_S0, (ch >> 0) & 0x01);
+  digitalWrite(MUX_S1, (ch >> 1) & 0x01);
+  digitalWrite(MUX_S2, (ch >> 2) & 0x01);
+  digitalWrite(MUX_S3, (ch >> 3) & 0x01);
+  delayMicroseconds(200);
 }
 
-inline bool readPressedRaw() {
-  int v = analogRead(SENSOR_PIN);
-#if PRESS_ACTIVE_LOW
-  return v < THRESHOLD;
-#else
-  return v > THRESHOLD;
-#endif
+inline bool isPressedVal(int v, int thr) {
+  return PRESS_IS_LOWER ? (v < thr) : (v > thr);
 }
 
-inline void clearTile() {
-  FastLED.clear();
+inline void setTileColor(int t, const CRGB &c) {
+  int s = tileStart[t], e = tileEnd(t);
+  for (int i = s; i < e; i++) leds[i] = c;
+}
+
+inline void clearAll() { fill_solid(leds, NUM_LEDS, CRGB::Black); }
+
+uint16_t labelsToMask(const uint8_t triplet[3]) {
+  uint16_t m = 0;
+  for (int i = 0; i < 3; i++) {
+    int idx = labelToIndex[triplet[i]];
+    if (idx >= 0) m |= (1u << idx);
+  }
+  return m;
+}
+
+void loadRequiredMask() {
+  requiredMask = labelsToMask(SEQ_LABELS[seqIndex]);
+  progressMask = 0;
+}
+
+void showCurrentSetPreview() {
+  clearAll();
+  for (int t = 0; t < NUM_TILES; t++) {
+    if (requiredMask & (1u << t)) setTileColor(t, tileColors[t]); // preview with per-tile color
+  }
   FastLED.show();
 }
 
-// Fill a rectangular region of the matrix with a color
-void fillRect(uint8_t r0, uint8_t r1, uint8_t c0, uint8_t c1, const CRGB &color) {
-  for (uint8_t r = r0; r <= r1 && r < MATRIX_H; ++r) {
-    for (uint8_t c = c0; c <= c1 && c < MATRIX_W; ++c) {
-      uint16_t idx = indexFromRC(r, c);
-      if (idx < LED_COUNT) {
-        leds[idx] = color;
-      }
-    }
-  }
+void startShowPhase() {
+  loadRequiredMask();
+  showCurrentSetPreview();
+  stateStart = millis();
+  state = SHOW_SET;
 }
 
-// Show 9 zones (3x3) with different colors
-void showZonesPattern() {
-  // Clear first so edges are clean
-  FastLED.clear();
-
-  // We split 16 rows/cols into 3 bands:
-  // rows: 0–4, 5–9, 10–15
-  // cols: 0–4, 5–9, 10–15
-
-  // Top row of zones
-  fillRect(0, 3,  0, 0,  CRGB::Red);       // top-left
-  //fillRect(0, 4,  5, 9,  CRGB::Green);     // top-middle
-  //fillRect(0, 4, 10, 15, CRGB::Blue);      // top-right
-
-  // Middle row of zones
-  //fillRect(5, 9,  0, 4,  CRGB::Yellow);    // mid-left
-  //fillRect(5, 9,  5, 9,  CRGB::Magenta);   // mid-middle
-  //fillRect(5, 9, 10, 15, CRGB::Cyan);      // mid-right
-
-  // Bottom row of zones
-  //fillRect(10, 15,  0, 4,  CRGB::Orange);  // bottom-left
-  //fillRect(10, 15,  5, 9,  CRGB::Purple);  // bottom-middle
-  //fillRect(10, 15, 10, 15, CRGB::White);   // bottom-right
-
-  FastLED.show();
+void advanceSequence() {
+  seqIndex = (seqIndex + 1) % SEQ_LEN;
+  startShowPhase();
 }
 
-// Keep solid blue as your "feedback" color
-inline void showBlue() {
-  fill_solid(leds, LED_COUNT, CRGB::Blue);
-  FastLED.show();
+void resetGame() {
+  seqIndex = 0;
+  wrongTile = -1;
+  startShowPhase();
 }
 
-inline void enter(State s) {
-  state = s;
-  stateStartMs = millis();
-}
-
-// Debounced rising edge: goes true once when we transition to pressed
-bool pressEdge(uint32_t now, bool pressedNow) {
-  if (pressedNow && !lastPressed && (now - lastEdgeMs >= DEBOUNCE_MS)) {
-    lastPressed = true;
-    lastEdgeMs  = now;
-    return true;
-  }
-  return false;
-}
-
-// Debounced falling edge: goes true once when we transition to released
-bool releaseEdge(uint32_t now, bool pressedNow) {
-  if (!pressedNow && lastPressed && (now - lastEdgeMs >= DEBOUNCE_MS)) {
-    lastPressed = false;
-    lastEdgeMs  = now;
-    return true;
-  }
-  return false;
-}
-
+// ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
-  delay(100);
 
-  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, LED_COUNT);
+  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
-  FastLED.clear(true);
+  clearAll();
+  FastLED.show();
 
-  pinMode(SENSOR_PIN, INPUT);
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
 
-  // Startup: show 9-zone pattern, then go into CUE_FLASH_GREEN state
-  showZonesPattern();
-  enter(CUE_FLASH_GREEN);
+  Serial.println("Sequential lighting in daisy-chain order...");
+  delay(500);
+
+  // Step 1: Light each tile sequentially in chain order (9→4→3→2→5→8→7→6→1)
+  for (int t = 0; t < NUM_TILES; t++) {
+    int s = tileStart[t], e = tileEnd(t);
+    for (int i = s; i < e; i++) leds[i] = tileColors[t];
+    FastLED.show();
+    delay(400);
+  }
+
+  // Step 2: Turn off all
+  clearAll();
+  FastLED.show();
+  Serial.println("Ready for memory game...");
+
+  // init press arrays
+  for (int i = 0; i < NUM_TILES; i++) pressedNow[i] = pressedPrev[i] = false;
+
+  // begin game
+  startShowPhase();
 }
 
+// ---------- LOOP ----------
 void loop() {
-  uint32_t now = millis();
-  bool pressedNow = readPressedRaw();
+  // -------- read sensors & update pressed states --------
+  for (int ch = 0; ch < NUM_TILES; ch++) {
+    selectMuxChannel(ch);
+    delayMicroseconds(150);
+    sensorValues[ch] = analogRead(MUX_SIG);
 
+    int t           = sensorToTile[ch];
+    pressedPrev[t]  = pressedNow[t];
+    pressedNow[t]   = isPressedVal(sensorValues[ch], thresholds[ch]);
+  }
+
+  // -------- state machine --------
   switch (state) {
-    case CUE_FLASH_GREEN: {
-      // Show zones for a brief cue, then go to WAIT_FOR_PRESS
-      if (now - stateStartMs >= FLASH_GREEN_MS) {
-        // Keep zones visible; just change state
-        enter(WAIT_FOR_PRESS);
+    case SHOW_SET: {
+      // keep preview on for SHOW_MS, then go dark and wait for input
+      if (millis() - stateStart >= SHOW_MS) {
+        clearAll();
+        FastLED.show();
+        state = WAIT_INPUT;
       }
     } break;
 
-    case WAIT_FOR_PRESS: {
-      // Idle: zones pattern visible
-      if (pressEdge(now, pressedNow)) {
-        // On initial press: keep zones visible for now
-        // (Later you can change to highlight a specific zone)
-        showZonesPattern();
-        enter(PRESSED_HELD);
+    case WAIT_INPUT: {
+      bool completed = false;
+
+      // draw: pressed required -> green; pressed not-required -> red; else off
+      clearAll();
+      for (int t = 0; t < NUM_TILES; t++) {
+        bool isReq = (requiredMask & (1u << t));
+        if (pressedNow[t]) {
+          setTileColor(t, isReq ? CRGB::Green : CRGB::Red);
+        }
+        // rising edge logic
+        if (pressedNow[t] && !pressedPrev[t]) {
+          if (isReq) {
+            progressMask |= (1u << t);
+            if ((progressMask & requiredMask) == requiredMask) completed = true;
+          } else {
+            wrongTile = t;
+            state = WRONG_HOLD;
+          }
+        }
+      }
+      FastLED.show();
+
+      if (completed) {
+        // tiny grace to avoid immediate bounce
+        delay(120);
+        advanceSequence();
       }
     } break;
 
-    case PRESSED_HELD: {
-      // While pressed: still show zones (you can change this later if desired)
-      if (releaseEdge(now, pressedNow)) {
-        // On release: flash blue to confirm recorded press
-        showBlue();
-        enter(FEEDBACK_BLUE);
+    case WRONG_HOLD: {
+      // while any wrong or other tiles are pressed: required pressed = green, others = red
+      bool anyPressed = false;
+      clearAll();
+      for (int t = 0; t < NUM_TILES; t++) {
+        if (pressedNow[t]) {
+          anyPressed = true;
+          bool isReq = (requiredMask & (1u << t));
+          setTileColor(t, isReq ? CRGB::Green : CRGB::Red);
+        }
       }
-    } break;
+      FastLED.show();
 
-    case FEEDBACK_BLUE: {
-      if (now - stateStartMs >= FEEDBACK_BLUE_MS) {
-        // After blue feedback, go back to zone pattern and wait again
-        showZonesPattern();
-        enter(WAIT_FOR_PRESS);
+      // when all feet lift, hard reset to very first set
+      if (!anyPressed) {
+        resetGame();
       }
     } break;
   }
+
+  // -------- optional debug --------
+  /*
+  static uint32_t last = 0;
+  if (millis() - last > 300) {
+    last = millis();
+    Serial.print("Sensors: ");
+    for (int i = 0; i < NUM_TILES; i++) Serial.printf("%4d ", sensorValues[i]);
+    Serial.print(" | Pressed: ");
+    for (int t = 0; t < NUM_TILES; t++) Serial.print(pressedNow[t] ? '1' : '0');
+    Serial.print(" | Required mask: ");
+    Serial.println(requiredMask, BIN);
+  }
+  */
 }
