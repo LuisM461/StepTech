@@ -25,9 +25,9 @@ const bool PRESS_IS_LOWER = true;  // true = value drops when pressed
 // ---------- INDIVIDUAL THRESHOLDS (per MUX channel C0..C8) ----------
 int thresholds[NUM_TILES] = {
   50,   // C0 → Tile 1 (label 1)
-  50,   // C1 → Tile 2
+  120,   // C1 → Tile 2
   50,   // C2 → Tile 3
-  50,   // C3 → Tile 4
+  120,   // C3 → Tile 4
   50,  // C4 → Tile 5
   50,  // C5 → Tile 6
   50,  // C6 → Tile 7
