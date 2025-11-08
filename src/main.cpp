@@ -1,136 +1,122 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// ---------- Wi-Fi config ----------
-const char* AP_SSID     = "ESP32_TILE";
-const char* AP_PASSWORD = "steptech123";   // change this if you want
+// --------- Global state ----------
+int tileMode = 0;            // 0 = idle, 1 = game, etc.
+bool deviceConnected = false;
 
-WebServer server(80);
+// Use Nordic UART Service (NUS) UUIDs (common pattern)
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // write from phone
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // notify to phone
 
-// A simple "state" variable we'll read/change from the phone
-int tileMode = 0;  // 0 = idle, 1 = game, etc.
+BLECharacteristic *pTxCharacteristic = nullptr;
 
-// ---------- HTML page ----------
-String htmlPage() {
-  String page =
-"<!DOCTYPE html>\n"
-"<html>\n"
-"  <head>\n"
-"    <meta charset=\"UTF-8\">\n"
-"    <title>ESP32 Tile Control</title>\n"
-"    <style>\n"
-"      body { font-family: sans-serif; background:#111; color:#eee; text-align:center; }\n"
-"      h1 { margin-top: 30px; }\n"
-"      button {\n"
-"        padding: 12px 20px;\n"
-"        margin: 10px;\n"
-"        font-size: 16px;\n"
-"        border-radius: 8px;\n"
-"        border: none;\n"
-"        cursor: pointer;\n"
-"      }\n"
-"      .idle { background:#444; }\n"
-"      .game { background:#2e8b57; }\n"
-"    </style>\n"
-"  </head>\n"
-"  <body>\n"
-"    <h1>ESP32 Tile Control</h1>\n"
-"    <p>Current mode: <span id=\"mode\">?</span></p>\n"
-"    <button class=\"idle\" onclick=\"setMode(0)\">Idle</button>\n"
-"    <button class=\"game\" onclick=\"setMode(1)\">Game</button>\n"
-"\n"
-"    <script>\n"
-"      function setMode(m) {\n"
-"        fetch(\"/setMode?value=\" + m)\n"
-"          .then(r => r.text())\n"
-"          .then(t => {\n"
-"            console.log(\"Response:\", t);\n"
-"            updateMode();\n"
-"          });\n"
-"      }\n"
-"\n"
-"      function updateMode() {\n"
-"        fetch(\"/getMode\")\n"
-"          .then(r => r.text())\n"
-"          .then(t => {\n"
-"            document.getElementById(\"mode\").innerText = t;\n"
-"          });\n"
-"      }\n"
-"\n"
-"      // Load on page open\n"
-"      updateMode();\n"
-"      // Auto-refresh every 2 seconds\n"
-"      setInterval(updateMode, 2000);\n"
-"    </script>\n"
-"  </body>\n"
-"</html>\n";
-
-  return page;
-}
-
-// ---------- HTTP handlers ----------
-void handleRoot() {
-  server.send(200, "text/html", htmlPage());
-}
-
-void handleGetMode() {
-  String s = String(tileMode);
-  server.send(200, "text/plain", s);
-}
-
-void handleSetMode() {
-  if (server.hasArg("value")) {
-    tileMode = server.arg("value").toInt();
-    Serial.print("Mode set from phone: ");
-    Serial.println(tileMode);
-    // TODO: here you can trigger LED behavior based on tileMode
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(400, "text/plain", "Missing 'value' parameter");
+// ---------- Callbacks for connect / disconnect ----------
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) override {
+    deviceConnected = true;
+    Serial.println("BLE device connected");
   }
-}
 
-void handleNotFound() {
-  server.send(404, "text/plain", "Not found");
-}
+  void onDisconnect(BLEServer *pServer) override {
+    deviceConnected = false;
+    Serial.println("BLE device disconnected");
 
-// ---------- Setup / Loop ----------
+    // Restart advertising so phone can reconnect
+    pServer->getAdvertising()->start();
+    Serial.println("Advertising restarted");
+  }
+};
+
+// ---------- Callbacks for RX (data from phone) ----------
+class MyRxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    std::string rxValue = pCharacteristic->getValue();
+    if (rxValue.length() == 0) return;
+
+    Serial.print("Received via BLE: ");
+    Serial.println(rxValue.c_str());
+
+    // Example: first char '0' or '1' sets tileMode
+    char c = rxValue[0];
+    if (c == '0' || c == '1') {
+      tileMode = c - '0';
+      Serial.print("tileMode updated to: ");
+      Serial.println(tileMode);
+
+      // (Optional) send confirmation back to phone
+      if (pTxCharacteristic && deviceConnected) {
+        String msg = "Mode set to ";
+        msg += tileMode;
+        pTxCharacteristic->setValue(msg.c_str());
+        pTxCharacteristic->notify();  // phone should subscribe to notifications
+      }
+    } else {
+      // Handle other commands here if you want
+      Serial.println("Unknown command (expected '0' or '1')");
+    }
+  }
+};
+
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Start Wi-Fi Access Point
-  Serial.println("Starting Wi-Fi AP...");
-  WiFi.mode(WIFI_AP);
-  bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
-  if (!apStarted) {
-    Serial.println("Failed to start AP!");
-  } else {
-    Serial.print("AP started. SSID: ");
-    Serial.println(AP_SSID);
+  Serial.println("Starting BLE...");
 
-    IPAddress IP = WiFi.softAPIP();
-    Serial.print("AP IP address: ");
-    Serial.println(IP);   // typically 192.168.4.1
-  }
+  BLEDevice::init("ESP32_TILE_BLE");
 
-  // Setup routes
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/getMode", HTTP_GET, handleGetMode);
-  server.on("/setMode", HTTP_GET, handleSetMode);
-  server.onNotFound(handleNotFound);
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
 
-  server.begin();
-  Serial.println("HTTP server started");
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // TX characteristic (ESP32 → phone)
+  pTxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_TX,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // RX characteristic (phone → ESP32)
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_RX,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pRxCharacteristic->setCallbacks(new MyRxCallbacks());
+
+  // Start service
+  pService->start();
+
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // helps with iOS
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE UART service started, advertising as ESP32_TILE_BLE");
 }
 
+// ---------- Loop ----------
 void loop() {
-  // Handle incoming HTTP requests
-  server.handleClient();
+  // For now, just periodically print tileMode so you see it's alive
+  static unsigned long lastPrint = 0;
+  unsigned long now = millis();
 
-  // Here you would use tileMode to control LEDs, etc.
-  // Example:
+  if (now - lastPrint > 3000) {
+    lastPrint = now;
+    Serial.print("Current tileMode = ");
+    Serial.println(tileMode);
+  }
+
+  // Later:
   // if (tileMode == 0) showIdlePattern();
   // else if (tileMode == 1) showGamePattern();
 }
