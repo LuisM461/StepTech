@@ -24,15 +24,15 @@ const bool PRESS_IS_LOWER = true;  // true = value drops when pressed
 
 // ---------- INDIVIDUAL THRESHOLDS (per MUX channel C0..C8) ----------
 int thresholds[NUM_TILES] = {
-  25,   // C0 → Tile 1 (label 1)
-  25,   // C1 → Tile 2
-  25,   // C2 → Tile 3
-  25,   // C3 → Tile 4
-  100,  // C4 → Tile 5
-  100,  // C5 → Tile 6
-  100,  // C6 → Tile 7
-  100,  // C7 → Tile 8
-  100   // C8 → Tile 9
+  50,   // C0 → Tile 1 (label 1)
+  50,   // C1 → Tile 2
+  50,   // C2 → Tile 3
+  50,   // C3 → Tile 4
+  50,  // C4 → Tile 5
+  50,  // C5 → Tile 6
+  50,  // C6 → Tile 7
+  50,  // C7 → Tile 8
+  50   // C8 → Tile 9
 };
 
 // ---------- LED INDEX MAP (daisy-chain order) ----------
